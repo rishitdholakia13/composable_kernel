@@ -4,6 +4,7 @@
 #pragma once
 
 #include "ck/utility/common_header.hpp"
+#include "ck/utility/numeric_limits.hpp"
 #include "ck/tensor_description/multi_index_transform_helper.hpp"
 #include "ck/tensor_description/tensor_descriptor.hpp"
 #include "ck/tensor_description/tensor_descriptor_helper.hpp"
@@ -723,7 +724,8 @@ struct GridwiseMoeGemmBlockScale
                                     index_t StrideB_,
                                     std::array<index_t, NumDTensor> StrideDs_,
                                     index_t StrideC_,
-                                    index_t KBatch_)
+                                    index_t KBatch_,
+                                    float SwigluLimit_ = NumericLimits<float>::Infinity())
             : NumTokens{NumTokens_},
               TopK{TopK_},
               M{M_},
@@ -741,7 +743,8 @@ struct GridwiseMoeGemmBlockScale
               AK0{CalculateAK0Padded(K_, KBatch_)},
               BK0{CalculateBK0Padded(K_, KBatch_)},
               MBlock{CalculateMBlock(M_)},
-              NBlock{CalculateNBlock(N_)}
+              NBlock{CalculateNBlock(N_)},
+              SwigluLimit{SwigluLimit_}
         {
         }
 
@@ -774,6 +777,8 @@ struct GridwiseMoeGemmBlockScale
         index_t BK0;
         index_t MBlock;
         index_t NBlock;
+        // Gate/up clamp bound for silu_clamp_and_mul; +inf leaves the output unclamped.
+        float SwigluLimit;
     };
 
     // Argument
@@ -800,7 +805,8 @@ struct GridwiseMoeGemmBlockScale
                           index_t k_batch_,
                           AElementwiseOperation a_element_op_,
                           BElementwiseOperation b_element_op_,
-                          CElementwiseOperation c_element_op_)
+                          CElementwiseOperation c_element_op_,
+                          float swiglu_limit_ = NumericLimits<float>::Infinity())
             : Problem{NumTokens_,
                       TopK_,
                       M_,
@@ -810,7 +816,8 @@ struct GridwiseMoeGemmBlockScale
                       StrideB_,
                       StrideDs_,
                       StrideC_,
-                      k_batch_},
+                      k_batch_,
+                      swiglu_limit_},
               p_sorted_token_ids{p_sorted_token_ids_},
               p_sorted_expert_ids{p_sorted_expert_ids_},
               p_max_token_id{p_max_token_id_},
@@ -1157,9 +1164,10 @@ struct GridwiseMoeGemmBlockScale
         static_assert(ActivationOperation == Activation::gelu_and_mul ||
                           ActivationOperation == Activation::silu_and_mul ||
                           ActivationOperation == Activation::swiglustep_and_mul ||
-                          ActivationOperation == Activation::gelu_tanh_and_mul,
+                          ActivationOperation == Activation::gelu_tanh_and_mul ||
+                          ActivationOperation == Activation::silu_clamp_and_mul,
                       "gridwise_moe_gemm_blockscale only supports gelu_and_mul, silu_and_mul, "
-                      "swiglustep_and_mul and gelu_tanh_and_mul.");
+                      "swiglustep_and_mul, gelu_tanh_and_mul and silu_clamp_and_mul.");
 #if defined(__gfx942__) || defined(__gfx950__)
         constexpr auto b_coherence_flag = NonTemporalLoadB
                                               ? AmdBufferCoherenceEnum::WAVE_NT1
@@ -1642,6 +1650,26 @@ struct GridwiseMoeGemmBlockScale
                                 up                 = up < 7.0f ? (up > -7.0f ? up : -7.0f) : 7.0f;
                                 c_thread_buf(cidx) = gate * up;
                             }
+                            else if constexpr(ActivationOperation == Activation::silu_clamp_and_mul)
+                            {
+                                float gate        = c_thread_buf[cidx];
+                                float up          = c_thread_buf_up[cidx];
+                                const float limit = problem.SwigluLimit;
+                                if constexpr(MulRoutedWeight)
+                                {
+                                    gate = gate * topk_weight;
+                                    up   = up * topk_weight;
+                                }
+                                if constexpr(is_same_v<remove_cvref_t<BDataType>, pk_i4_t>)
+                                {
+                                    gate *= 16;
+                                    up *= 16;
+                                }
+                                gate = gate < limit ? gate : limit;
+                                up   = up < limit ? (up > -limit ? up : -limit) : limit;
+                                tensor_operation::element_wise::Silu{}(gate, gate);
+                                c_thread_buf(cidx) = gate * up;
+                            }
                             else if(ActivationOperation == Activation::gelu_and_mul)
                             {
                                 float gate = c_thread_buf[cidx];
@@ -1734,9 +1762,10 @@ struct GridwiseMoeGemmBlockScale
         static_assert(ActivationOperation == Activation::gelu_and_mul ||
                           ActivationOperation == Activation::silu_and_mul ||
                           ActivationOperation == Activation::swiglustep_and_mul ||
-                          ActivationOperation == Activation::gelu_tanh_and_mul,
+                          ActivationOperation == Activation::gelu_tanh_and_mul ||
+                          ActivationOperation == Activation::silu_clamp_and_mul,
                       "gridwise_moe_gemm_blockscale only supports gelu_and_mul, silu_and_mul, "
-                      "swiglustep_and_mul and gelu_tanh_and_mul.");
+                      "swiglustep_and_mul, gelu_tanh_and_mul and silu_clamp_and_mul.");
 #if defined(__gfx942__) || defined(__gfx950__)
         constexpr auto b_coherence_flag = NonTemporalLoadB
                                               ? AmdBufferCoherenceEnum::WAVE_NT1
@@ -2208,6 +2237,26 @@ struct GridwiseMoeGemmBlockScale
                                 tensor_operation::element_wise::Silu{}(gate, gate);
                                 gate               = gate < 7.0f ? gate : 7.0f;
                                 up                 = up < 7.0f ? (up > -7.0f ? up : -7.0f) : 7.0f;
+                                c_thread_buf(cidx) = gate * up;
+                            }
+                            else if constexpr(ActivationOperation == Activation::silu_clamp_and_mul)
+                            {
+                                float gate        = c_thread_buf[cidx];
+                                float up          = c_thread_buf_up[cidx];
+                                const float limit = problem.SwigluLimit;
+                                if constexpr(MulRoutedWeight)
+                                {
+                                    gate = gate * topk_weight;
+                                    up   = up * topk_weight;
+                                }
+                                if constexpr(is_same_v<remove_cvref_t<BDataType>, pk_i4_t>)
+                                {
+                                    gate *= 16;
+                                    up *= 16;
+                                }
+                                gate = gate < limit ? gate : limit;
+                                up   = up < limit ? (up > -limit ? up : -limit) : limit;
+                                tensor_operation::element_wise::Silu{}(gate, gate);
                                 c_thread_buf(cidx) = gate * up;
                             }
                             else if(ActivationOperation == Activation::gelu_and_mul)

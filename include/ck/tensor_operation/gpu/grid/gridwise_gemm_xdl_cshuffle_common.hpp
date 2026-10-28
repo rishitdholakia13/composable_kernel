@@ -32,7 +32,10 @@ enum Activation
     silu_and_mul       = 1,
     swiglustep_and_mul = 2,
     swiglu_oai_and_mul = 3,
-    gelu_tanh_and_mul  = 4
+    gelu_tanh_and_mul  = 4,
+    // silu(min(gate, L)) * clamp(up, -L, L), with L read at runtime from the
+    // kernel argument (Problem::SwigluLimit) instead of compiled in.
+    silu_clamp_and_mul = 5
 };
 
 // OAI / gpt-oss SwiGLU activation: gate * sigmoid(alpha * gate) * (up + 1), with a
